@@ -140,9 +140,39 @@ async function startServer() {
             const px = bx * BLOCK_SIZE;
             const py = by * BLOCK_SIZE;
             
-            const targetR = Math.floor((Math.sin(bx * 0.1 + i * 0.1) * 0.5 + 0.5) * 255);
-            const targetG = Math.floor((Math.cos(by * 0.1 + i * 0.15) * 0.5 + 0.5) * 255);
-            const targetB = Math.floor((Math.sin((bx + by) * 0.05 - i * 0.05) * 0.5 + 0.5) * 255);
+            let targetR = 192, targetG = 192, targetB = 192;
+            let tileStyle = 0; // 0=unrevealed, 1=flag, 2=empty, 3=1, 4=2, 5=3, 6=4
+
+            const zone = Math.sin(bx * 0.2 + 1) * Math.cos(by * 0.2) + Math.sin((bx + by) * 0.05);
+            const rand = Math.abs(Math.sin(bx * 12.9898 + by * 78.233)) * 43758.5453;
+            const frac = rand - Math.floor(rand);
+
+            if (zone > 0.5) {
+                tileStyle = 0;
+                if (frac < 0.05) tileStyle = 1;
+            } else if (zone > 0.0) {
+                if (frac < 0.15) tileStyle = 1;
+                else if (frac < 0.4) tileStyle = 3; // 1
+                else if (frac < 0.6) tileStyle = 4; // 2
+                else if (frac < 0.7) tileStyle = 5; // 3
+                else if (frac < 0.75) tileStyle = 6; // 4
+                else tileStyle = 0;
+            } else {
+                if (frac < 0.1) tileStyle = 3;
+                else if (frac < 0.15) tileStyle = 4;
+                else tileStyle = 2; // empty
+            }
+
+            if (isCorner(bx, by)) {
+               tileStyle = 0;
+            }
+
+            if (tileStyle === 1) { targetR = 255; targetG = 0; targetB = 0; }
+            else if (tileStyle === 3) { targetR = 0; targetG = 0; targetB = 255; }
+            else if (tileStyle === 4) { targetR = 0; targetG = 128; targetB = 0; }
+            else if (tileStyle === 5) { targetR = 255; targetG = 0; targetB = 0; }
+            else if (tileStyle === 6) { targetR = 0; targetG = 0; targetB = 128; }
+            else { targetR = 192; targetG = 192; targetB = 192; }
 
             let bitR = 0, bitG = 0, bitB = 0;
             
@@ -169,9 +199,22 @@ async function startServer() {
             for (let y = 0; y < BLOCK_SIZE; y++) {
               for (let x = 0; x < BLOCK_SIZE; x++) {
                 const pIdx = ((py + y) * actualWidth + (px + x)) * 4;
-                pixels[pIdx] = finR;
-                pixels[pIdx+1] = finG;
-                pixels[pIdx+2] = finB;
+                let pR = 192, pG = 192, pB = 192;
+                
+                if (tileStyle === 0 || tileStyle === 1) {
+                    if (x === 0 || y === 0) { pR = 240; pG = 240; pB = 240; }
+                    else if (x === 7 || y === 7) { pR = 100; pG = 100; pB = 100; }
+                    else if (x >= 2 && x <= 5 && y >= 2 && y <= 5) { pR = finR; pG = finG; pB = finB; }
+                    else { pR = 192; pG = 192; pB = 192; }
+                } else {
+                    if (x === 0 || y === 0) { pR = 100; pG = 100; pB = 100; }
+                    else if (x >= 2 && x <= 5 && y >= 2 && y <= 5) { pR = finR; pG = finG; pB = finB; }
+                    else { pR = 192; pG = 192; pB = 192; }
+                }
+
+                pixels[pIdx] = pR;
+                pixels[pIdx+1] = pG;
+                pixels[pIdx+2] = pB;
                 pixels[pIdx+3] = 255;
               }
             }
@@ -202,9 +245,9 @@ async function startServer() {
           .output(outputPath)
           .videoCodec('libx264');
 
-        let outOpts = ['-pix_fmt yuv444p'];
+        let outOpts = ['-pix_fmt yuv420p'];
         if (bitrate === 'lossless') {
-           outOpts.push('-crf', '0');
+           outOpts.push('-crf', '2'); // Using 2 instead of 0 because 0 creates High 4:4:4 Predictive profile which browsers cannot play.
         } else {
            outOpts.push('-b:v', bitrate);
         }

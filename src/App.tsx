@@ -319,7 +319,7 @@ export default function App() {
                     onChange={(e) => setEncodeOptions(prev => ({...prev, bitrate: e.target.value}))}
                     className="w-full bg-[#0D0E11] border border-[#2A2D32] text-[#E0E0E0] rounded p-2 text-xs focus:border-[#FF5500] outline-none"
                   >
-                    <option value="lossless">Lossless CRF 0 (Safe)</option>
+                    <option value="lossless">High Quality CRF 2 (Safe)</option>
                     <option value="50M">50 Mbps (Very High)</option>
                     <option value="10M">10 Mbps (High)</option>
                     <option value="2M">2 Mbps (Risky - Data Loss)</option>
