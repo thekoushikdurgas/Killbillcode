@@ -3,6 +3,7 @@ import multer from 'multer';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import ffmpegPath from 'ffmpeg-static';
 import ffmpeg from 'fluent-ffmpeg';
 import { createCanvas, loadImage } from 'canvas';
@@ -10,6 +11,19 @@ import { createCanvas, loadImage } from 'canvas';
 if (ffmpegPath) {
   ffmpeg.setFfmpegPath(ffmpegPath);
 }
+
+const encodeProgressMap = new Map<string, { status: string, progress: number, timestamp: number }>();
+const decodeProgressMap = new Map<string, { status: string, progress: number, timestamp: number }>();
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [jobId, job] of encodeProgressMap.entries()) {
+    if (now - job.timestamp > 3600000) encodeProgressMap.delete(jobId);
+  }
+  for (const [jobId, job] of decodeProgressMap.entries()) {
+    if (now - job.timestamp > 3600000) decodeProgressMap.delete(jobId);
+  }
+}, 60000);
 
 async function startServer() {
   const app = express();
@@ -22,6 +36,18 @@ async function startServer() {
 
   app.use(express.json());
 
+  app.get('/api/progress/encode/:jobId', (req, res) => {
+    const job = encodeProgressMap.get(req.params.jobId);
+    if (!job) return res.json({ progress: 0, status: 'unknown' });
+    res.json(job);
+  });
+
+  app.get('/api/progress/decode/:jobId', (req, res) => {
+    const job = decodeProgressMap.get(req.params.jobId);
+    if (!job) return res.json({ progress: 0, status: 'unknown' });
+    res.json(job);
+  });
+
   // API to encode text to mp4
   app.post('/api/encode', upload.single('csv'), async (req, res) => {
     try {
@@ -33,63 +59,150 @@ async function startServer() {
       if (isNaN(HEIGHT)) HEIGHT = 720;
       const fps = parseInt(req.body.fps, 10) || 1;
       const bitrate = req.body.bitrate || 'lossless';
+      const jobId = req.body.jobId;
 
-      const buffer = fs.readFileSync(req.file.path);
-      const lengthBuffer = Buffer.alloc(4);
-      lengthBuffer.writeUInt32BE(buffer.length, 0);
-      
-      const fullBuffer = Buffer.concat([lengthBuffer, buffer]);
+      const updateProgress = (status: string, progress: number) => {
+        if (jobId) {
+          encodeProgressMap.set(jobId, { status, progress, timestamp: Date.now() });
+        }
+      };
+
+      updateProgress('generating_frames', 0);
+
+      let rawData = fs.readFileSync(req.file.path);
+      const manualKeyString = req.body.encryptionKey || "DEFAULT_KEY";
       
       const BLOCK_SIZE = 8;
       const BLOCKS_X = Math.floor(WIDTH / BLOCK_SIZE);
       const BLOCKS_Y = Math.floor(HEIGHT / BLOCK_SIZE);
-      const BITS_PER_FRAME = BLOCKS_X * BLOCKS_Y;
-      const BYTES_PER_FRAME = Math.floor(BITS_PER_FRAME / 8);
+      const TOTAL_BLOCKS = BLOCKS_X * BLOCKS_Y;
+      const CORNER_BLOCKS = 144; // 12x12
+      const DATA_BLOCKS = TOTAL_BLOCKS - CORNER_BLOCKS;
       
-      const numFrames = Math.ceil(fullBuffer.length / BYTES_PER_FRAME);
+      if (DATA_BLOCKS < 100) throw new Error("Video resolution too small");
+
+      const MAX_ENCRYPTED_BYTES = Math.floor((DATA_BLOCKS * 3) / 8); 
+      const MAX_RAW_PER_FRAME = MAX_ENCRYPTED_BYTES - 2; 
+
+      const numFrames = Math.max(1, Math.ceil(rawData.length / MAX_RAW_PER_FRAME));
       
       const framesDir = path.join(process.cwd(), 'frames', Date.now().toString());
       fs.mkdirSync(framesDir, { recursive: true });
       
+      const actualWidth = BLOCKS_X * BLOCK_SIZE;
+      const actualHeight = BLOCKS_Y * BLOCK_SIZE;
+      
+      const manualKeyHash = crypto.createHash('sha256').update(String(manualKeyString)).digest();
+      const isCorner = (bx: number, by: number) => bx < 12 && by < 12;
+
       for (let i = 0; i < numFrames; i++) {
-        const canvas = createCanvas(WIDTH, HEIGHT);
-        const ctx = canvas.getContext('2d');
-        ctx.fillStyle = 'black';
-        ctx.fillRect(0, 0, WIDTH, HEIGHT);
+        const startRaw = i * MAX_RAW_PER_FRAME;
+        const endRaw = Math.min(startRaw + MAX_RAW_PER_FRAME, rawData.length);
+        const rawChunk = rawData.subarray(startRaw, endRaw);
+
+        const chunkWithLen = Buffer.alloc(rawChunk.length + 2);
+        chunkWithLen.writeUInt16BE(rawChunk.length, 0);
+        rawChunk.copy(chunkWithLen, 2);
+
+        const frameKey = crypto.randomBytes(32);
+        const frameIV = crypto.randomBytes(16);
+
+        const keyCipher = crypto.createCipheriv('aes-256-ctr', manualKeyHash, frameIV);
+        const encryptedFrameKey = Buffer.concat([keyCipher.update(frameKey), keyCipher.final()]);
+
+        const dataCipher = crypto.createCipheriv('aes-256-ctr', frameKey, frameIV);
+        const encryptedChunk = Buffer.concat([dataCipher.update(chunkWithLen), dataCipher.final()]);
+
+        const cornerData = Buffer.concat([frameIV, encryptedFrameKey]);
+        const cornerBits: number[] = [];
+        for (let b = 0; b < cornerData.length; b++) {
+          const byte = cornerData[b];
+          for (let bit = 7; bit >= 0; bit--) cornerBits.push((byte >> bit) & 1);
+        }
+
+        const dataBits: number[] = [];
+        for (let b = 0; b < encryptedChunk.length; b++) {
+          const byte = encryptedChunk[b];
+          for (let bit = 7; bit >= 0; bit--) dataBits.push((byte >> bit) & 1);
+        }
+
+        const canvas = createCanvas(actualWidth, actualHeight);
+        const ctx = canvas.getContext('2d')!;
         
-        let bitIndex = 0;
-        for (let j = 0; j < BYTES_PER_FRAME; j++) {
-          const byteIndex = i * BYTES_PER_FRAME + j;
-          if (byteIndex < fullBuffer.length) {
-            const byte = fullBuffer[byteIndex];
-            for (let b = 7; b >= 0; b--) {
-              const bit = (byte >> b) & 1;
-              const bx = bitIndex % BLOCKS_X;
-              const by = Math.floor(bitIndex / BLOCKS_X);
-              ctx.fillStyle = bit === 1 ? 'white' : 'black';
-              ctx.fillRect(bx * BLOCK_SIZE, by * BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE);
-              bitIndex++;
+        const imageData = ctx.createImageData(actualWidth, actualHeight);
+        const pixels = imageData.data;
+        
+        let cornerBitIdx = 0;
+        let dataBitIdx = 0;
+
+        for (let by = 0; by < BLOCKS_Y; by++) {
+          for (let bx = 0; bx < BLOCKS_X; bx++) {
+            const px = bx * BLOCK_SIZE;
+            const py = by * BLOCK_SIZE;
+            
+            const targetR = Math.floor((Math.sin(bx * 0.1 + i * 0.1) * 0.5 + 0.5) * 255);
+            const targetG = Math.floor((Math.cos(by * 0.1 + i * 0.15) * 0.5 + 0.5) * 255);
+            const targetB = Math.floor((Math.sin((bx + by) * 0.05 - i * 0.05) * 0.5 + 0.5) * 255);
+
+            let bitR = 0, bitG = 0, bitB = 0;
+            
+            if (isCorner(bx, by)) {
+              if (cornerBitIdx < 384) {
+                 bitR = cornerBits[cornerBitIdx++];
+                 bitG = cornerBits[cornerBitIdx++];
+                 bitB = cornerBits[cornerBitIdx++];
+              }
+            } else {
+              bitR = dataBitIdx < dataBits.length ? dataBits[dataBitIdx++] : 0;
+              bitG = dataBitIdx < dataBits.length ? dataBits[dataBitIdx++] : 0;
+              bitB = dataBitIdx < dataBits.length ? dataBits[dataBitIdx++] : 0;
+            }
+
+            let finR = (Math.floor(targetR / 64) * 64) + 16 + (bitR * 32);
+            let finG = (Math.floor(targetG / 64) * 64) + 16 + (bitG * 32);
+            let finB = (Math.floor(targetB / 64) * 64) + 16 + (bitB * 32);
+            
+            finR = Math.min(255, Math.max(0, finR));
+            finG = Math.min(255, Math.max(0, finG));
+            finB = Math.min(255, Math.max(0, finB));
+
+            for (let y = 0; y < BLOCK_SIZE; y++) {
+              for (let x = 0; x < BLOCK_SIZE; x++) {
+                const pIdx = ((py + y) * actualWidth + (px + x)) * 4;
+                pixels[pIdx] = finR;
+                pixels[pIdx+1] = finG;
+                pixels[pIdx+2] = finB;
+                pixels[pIdx+3] = 255;
+              }
             }
           }
         }
         
+        ctx.putImageData(imageData, 0, 0);
+        
         const out = fs.createWriteStream(path.join(framesDir, `frame-${String(i).padStart(4, '0')}.png`));
         const stream = canvas.createPNGStream();
         stream.pipe(out);
-        await new Promise((resolve) => out.on('finish', resolve));
+        await new Promise<void>((resolve) => out.on('finish', () => resolve()));
+
+        if (i % 10 === 0) {
+          updateProgress('generating_frames', Math.round((i / numFrames) * 100));
+        }
       }
       
+      updateProgress('encoding_video', 0);
+
       const outputName = `${Date.now()}.mp4`;
       const outputPath = path.join(process.cwd(), 'uploads', outputName);
       
-      await new Promise((resolve, reject) => {
+      await new Promise<void>((resolve, reject) => {
         let cmd = ffmpeg()
           .input(path.join(framesDir, 'frame-%04d.png'))
           .inputFPS(fps)
           .output(outputPath)
           .videoCodec('libx264');
 
-        let outOpts = ['-pix_fmt yuv420p'];
+        let outOpts = ['-pix_fmt yuv444p'];
         if (bitrate === 'lossless') {
            outOpts.push('-crf', '0');
         } else {
@@ -97,7 +210,15 @@ async function startServer() {
         }
 
         cmd.outputOptions(outOpts)
-          .on('end', resolve)
+          .on('progress', (progress) => {
+             if (progress.frames) {
+               updateProgress('encoding_video', Math.round((progress.frames / numFrames) * 100));
+             }
+          })
+          .on('end', () => {
+             updateProgress('done', 100);
+             resolve();
+          })
           .on('error', reject)
           .run();
       });
@@ -121,9 +242,18 @@ async function startServer() {
     if (!req.file) return res.status(400).json({ error: 'No video provided' });
     
     try {
+      const jobId = req.body.jobId;
+      const updateProgress = (status: string, progress: number) => {
+        if (jobId) {
+          decodeProgressMap.set(jobId, { status, progress, timestamp: Date.now() });
+        }
+      };
+
       const framesDir = path.join(process.cwd(), 'frames', req.file.filename);
       fs.mkdirSync(framesDir, { recursive: true });
       
+      updateProgress('extracting_frames', 0);
+
       await new Promise((resolve, reject) => {
         ffmpeg(req.file!.path)
           .output(path.join(framesDir, 'frame-%04d.png'))
@@ -135,6 +265,8 @@ async function startServer() {
       const files = fs.readdirSync(framesDir).sort();
       if (files.length === 0) throw new Error("No frames could be extracted from video");
       
+      updateProgress('reading_frames', 0);
+
       const firstImg = await loadImage(path.join(framesDir, files[0]));
       
       const BLOCK_SIZE = 8;
@@ -142,60 +274,109 @@ async function startServer() {
       const HEIGHT = firstImg.height;
       const BLOCKS_X = Math.floor(WIDTH / BLOCK_SIZE);
       const BLOCKS_Y = Math.floor(HEIGHT / BLOCK_SIZE);
-      const BYTES_PER_FRAME = Math.floor((BLOCKS_X * BLOCKS_Y) / 8);
+      const actualWidth = BLOCKS_X * BLOCK_SIZE;
+      const actualHeight = BLOCKS_Y * BLOCK_SIZE;
+      const TOTAL_BLOCKS = BLOCKS_X * BLOCKS_Y;
+      const CORNER_BLOCKS = 144;
+      const DATA_BLOCKS = TOTAL_BLOCKS - CORNER_BLOCKS;
+      const MAX_ENCRYPTED_BYTES = Math.floor((DATA_BLOCKS * 3) / 8); 
       
-      const canvas = createCanvas(WIDTH, HEIGHT);
-      const ctx = canvas.getContext('2d');
-      const chunks: Buffer[] = [];
+      const canvas = createCanvas(actualWidth, actualHeight);
+      const ctx = canvas.getContext('2d')!;
+      const chunkBuffers: Buffer[] = [];
       
-      for (const file of files) {
+      const manualKeyString = req.body.decryptionKey || "DEFAULT_KEY";
+      const manualKeyHash = crypto.createHash('sha256').update(String(manualKeyString)).digest();
+      const isCorner = (bx: number, by: number) => bx < 12 && by < 12;
+      
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
         const img = await loadImage(path.join(framesDir, file));
-        ctx.clearRect(0, 0, WIDTH, HEIGHT);
+        ctx.clearRect(0, 0, actualWidth, actualHeight);
         ctx.drawImage(img, 0, 0);
         
-        let bits = [];
-        const actualWidth = Math.min(img.width, WIDTH);
-        const actualHeight = Math.min(img.height, HEIGHT);
-        const bx_count = Math.floor(actualWidth / BLOCK_SIZE);
-        const by_count = Math.floor(actualHeight / BLOCK_SIZE);
-        
         const imageData = ctx.getImageData(0, 0, actualWidth, actualHeight).data;
-        const frameBuffer = Buffer.alloc(BYTES_PER_FRAME);
-        let byteIndex = 0;
-        
-        for (let y = 0; y < by_count; y++) {
-          for (let x = 0; x < bx_count; x++) {
-            if (byteIndex >= BYTES_PER_FRAME) break;
-            
-            const px = x * BLOCK_SIZE + Math.floor(BLOCK_SIZE / 2);
-            const py = y * BLOCK_SIZE + Math.floor(BLOCK_SIZE / 2);
-            const i = (py * actualWidth + px) * 4;
-            
-            const luminance = (imageData[i] * 0.299 + imageData[i+1] * 0.587 + imageData[i+2] * 0.114);
-            bits.push(luminance > 128 ? 1 : 0);
-            
-            if (bits.length === 8) {
-              const byte = bits.reduce((acc, bit, idx) => acc | (bit << (7 - idx)), 0);
-              frameBuffer[byteIndex++] = byte;
-              bits = [];
-            }
+        const cornerBits: number[] = [];
+        const dataBits: number[] = [];
+
+        for (let by = 0; by < BLOCKS_Y; by++) {
+          for (let bx = 0; bx < BLOCKS_X; bx++) {
+             const px = bx * BLOCK_SIZE + Math.floor(BLOCK_SIZE / 2);
+             const py = by * BLOCK_SIZE + Math.floor(BLOCK_SIZE / 2);
+             const pIdx = (py * actualWidth + px) * 4;
+             
+             const r = imageData[pIdx];
+             const g = imageData[pIdx+1];
+             const b = imageData[pIdx+2];
+
+             if(isCorner(bx, by)) {
+                if(cornerBits.length < 384) {
+                   cornerBits.push((r % 64) > 32 ? 1 : 0);
+                   cornerBits.push((g % 64) > 32 ? 1 : 0);
+                   cornerBits.push((b % 64) > 32 ? 1 : 0);
+                }
+             } else {
+                dataBits.push((r % 64) > 32 ? 1 : 0);
+                dataBits.push((g % 64) > 32 ? 1 : 0);
+                dataBits.push((b % 64) > 32 ? 1 : 0);
+             }
           }
         }
-        chunks.push(frameBuffer);
+           
+        const cornerData = Buffer.alloc(48);
+        for (let b = 0; b < 48; b++) {
+           let byte = 0;
+           for (let bit = 0; bit < 8; bit++) {
+              if (cornerBits[b*8 + bit]) byte |= (1 << (7 - bit));
+           }
+           cornerData[b] = byte;
+        }
+
+        const frameIV = cornerData.subarray(0, 16);
+        const encryptedFrameKey = cornerData.subarray(16, 48);
+
+         let frameKey;
+         try {
+           const keyDecipher = crypto.createDecipheriv('aes-256-ctr', manualKeyHash, frameIV);
+           frameKey = Buffer.concat([keyDecipher.update(encryptedFrameKey), keyDecipher.final()]);
+         } catch(e) {
+           throw new Error("Failed to decrypt FrameKey. Is the manual key correct?");
+         }
+
+        const maxEncData = Buffer.alloc(MAX_ENCRYPTED_BYTES);
+        for (let b = 0; b < MAX_ENCRYPTED_BYTES; b++) {
+           let byte = 0;
+           for(let bit = 0; bit < 8; bit++) {
+              if (dataBits[b*8 + bit]) byte |= (1 << (7 - bit));
+           }
+           maxEncData[b] = byte;
+        }
+
+         let decryptedChunk;
+         try {
+           const dataDecipher = crypto.createDecipheriv('aes-256-ctr', frameKey, frameIV);
+           decryptedChunk = Buffer.concat([dataDecipher.update(maxEncData), dataDecipher.final()]);
+         } catch(e) {
+           console.error("Frame chunk decrypt failed");
+           continue; 
+         }
+
+        const validLen = decryptedChunk.readUInt16BE(0);
+        if (validLen > decryptedChunk.length - 2) {
+           console.warn(`Frame ${i}: Valid length ${validLen} out of bounds. Corruption?`);
+        } else {
+           chunkBuffers.push(decryptedChunk.subarray(2, 2 + validLen));
+        }
+
+        if (i % 10 === 0) {
+           updateProgress('reading_frames', Math.round((i / files.length) * 100));
+        }
       }
       
-      const fullBuffer = Buffer.concat(chunks);
-      
-      // Reconstruct
-      if (fullBuffer.length < 4) {
-        throw new Error("Could not decode enough data. The video file might be malformed or not generated by this tool.");
-      }
-      const dataLen = fullBuffer.readUInt32BE(0);
-      if (dataLen === 0 || dataLen > 1536 * 1024 * 1024) {
-        throw new Error("Invalid embedded data length detected. Ensure the video was created by this tool without compression artifacts.");
-      }
-      
-      const data = fullBuffer.subarray(4, 4 + dataLen).toString('utf-8');
+      const fullBuffer = Buffer.concat(chunkBuffers);
+      const data = fullBuffer.toString('utf-8');
+
+      updateProgress('done', 100);
       
       // cleanup
       fs.rmSync(framesDir, { recursive: true, force: true });

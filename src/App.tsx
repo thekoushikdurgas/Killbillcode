@@ -15,6 +15,7 @@ export default function App() {
   const [csvColumns, setCsvColumns] = useState<string[]>([]);
   const [csvRaw, setCsvRaw] = useState<string>('');
   const [isEncoding, setIsEncoding] = useState(false);
+  const [encodeProgress, setEncodeProgress] = useState<{status: string, progress: number} | null>(null);
   const [encodeOptions, setEncodeOptions] = useState({
     width: '1280',
     height: '720',
@@ -24,12 +25,16 @@ export default function App() {
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   const [encodeError, setEncodeError] = useState('');
+  const [encryptVideo, setEncryptVideo] = useState(false);
+  const [encryptionKey, setEncryptionKey] = useState('');
 
   // Decode State
+  const [decodeProgress, setDecodeProgress] = useState<{status: string, progress: number} | null>(null);
   const [isDecoding, setIsDecoding] = useState(false);
   const [decodedCsv, setDecodedCsv] = useState<any[]>([]);
   const [decodedColumns, setDecodedColumns] = useState<string[]>([]);
   const [decodeError, setDecodeError] = useState('');
+  const [decryptionKey, setDecryptionKey] = useState('');
 
   const encodeVideoRef = useRef<HTMLVideoElement>(null);
 
@@ -60,22 +65,7 @@ export default function App() {
             setDownloadUrl(null);
             return;
           }
-          if (results.meta.fields) {
-            const fields = results.meta.fields.map(f => f.toLowerCase().trim());
-            const requiredColumns = ['name', 'email', 'phone'];
-            const missingColumns = requiredColumns.filter(col => !fields.includes(col));
-            
-            if (missingColumns.length > 0) {
-              setEncodeError(`Invalid CSV format: Missing required columns (${missingColumns.join(', ')}).`);
-              setCsvData([]);
-              setCsvColumns([]);
-              setCsvRaw('');
-              setCsvFile(null);
-              setVideoUrl(null);
-              setDownloadUrl(null);
-              return;
-            }
-            
+          if (results.meta.fields && results.meta.fields.length > 0) {
             setCsvColumns(results.meta.fields);
           } else {
             setEncodeError('Invalid CSV format: No columns found.');
@@ -106,18 +96,40 @@ export default function App() {
     if (!csvFile) return;
     setIsEncoding(true);
     setEncodeError('');
+    setEncodeProgress(null);
     try {
+      const jobId = Math.random().toString(36).substring(7);
       const formData = new FormData();
       formData.append('csv', csvFile);
       formData.append('width', encodeOptions.width);
       formData.append('height', encodeOptions.height);
       formData.append('fps', encodeOptions.fps);
       formData.append('bitrate', encodeOptions.bitrate);
+      formData.append('jobId', jobId);
+      if (encryptVideo && encryptionKey) {
+        formData.append('encryptionKey', encryptionKey);
+      }
+
+      const pollInterval = setInterval(async () => {
+        try {
+          const res = await fetch(`/api/progress/encode/${jobId}`);
+          if (res.ok) {
+             const json = await res.json();
+             if (json.status !== 'unknown') {
+               setEncodeProgress(json);
+             }
+          }
+        } catch (e) {}
+      }, 500);
 
       const res = await fetch('/api/encode', {
         method: 'POST',
         body: formData
       });
+      
+      clearInterval(pollInterval);
+      setEncodeProgress(null);
+
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || 'Encode failed');
       setVideoUrl(json.url);
@@ -138,8 +150,27 @@ export default function App() {
     setDecodedCsv([]);
     setDecodedColumns([]);
 
+    setDecodeProgress(null);
+
+    const jobId = Math.random().toString(36).substring(7);
     const formData = new FormData();
     formData.append('video', file);
+    formData.append('jobId', jobId);
+    if (decryptionKey) {
+      formData.append('decryptionKey', decryptionKey);
+    }
+
+    const pollInterval = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/progress/decode/${jobId}`);
+        if (res.ok) {
+           const json = await res.json();
+           if (json.status !== 'unknown') {
+             setDecodeProgress(json);
+           }
+        }
+      } catch (e) {}
+    }, 500);
 
     try {
       const res = await fetch('/api/decode', {
@@ -147,6 +178,9 @@ export default function App() {
         body: formData
       });
       
+      clearInterval(pollInterval);
+      setDecodeProgress(null);
+
       let json;
       try {
         const text = await res.text();
@@ -158,7 +192,7 @@ export default function App() {
         throw new Error('Failed to parse server response.');
       }
 
-      if (!res.ok) throw new Error(json.error || 'Decode failed');
+      if (!res.ok) throw new Error(json.message || json.error || 'Decode failed');
 
       Papa.parse(json.data, {
         header: true,
@@ -291,6 +325,28 @@ export default function App() {
                     <option value="2M">2 Mbps (Risky - Data Loss)</option>
                   </select>
                 </div>
+                <div className="md:col-span-3 mt-2 border border-[#2A2D32] rounded p-4 bg-[#14151A]">
+                  <label className="flex items-center gap-2 cursor-pointer mb-2">
+                    <input 
+                      type="checkbox" 
+                      checked={encryptVideo} 
+                      onChange={(e) => setEncryptVideo(e.target.checked)}
+                      className="accent-[#FF5500]"
+                    />
+                    <span className="text-xs text-[#E0E0E0] uppercase tracking-widest">Encrypt Video Data (AES-256)</span>
+                  </label>
+                  {encryptVideo && (
+                    <div className="flex gap-4">
+                      <input 
+                        type="text" 
+                        placeholder="Enter encryption key..."
+                        value={encryptionKey}
+                        onChange={(e) => setEncryptionKey(e.target.value)}
+                        className="w-full bg-[#0D0E11] border border-[#2A2D32] text-[#E0E0E0] rounded p-2 text-xs focus:border-[#FF5500] outline-none"
+                      />
+                    </div>
+                  )}
+                </div>
               </div>
 
               {csvData.length > 0 && (
@@ -306,6 +362,21 @@ export default function App() {
                       {isEncoding ? 'Encoding...' : 'Encode to Video'}
                     </button>
                   </div>
+                  
+                  {isEncoding && encodeProgress && (
+                    <div className="mb-6 p-4 border border-[#FF5500]/30 rounded bg-[#0D0E11]">
+                       <div className="flex justify-between items-center mb-2">
+                         <span className="text-xs uppercase tracking-widest text-[#9CA3AF] font-bold">
+                           {encodeProgress.status === 'generating_frames' ? 'Generating Frames...' : encodeProgress.status === 'encoding_video' ? 'Encoding Video with FFmpeg...' : 'Processing...'}
+                         </span>
+                         <span className="text-xs font-mono text-[#FF5500]">{encodeProgress.progress}%</span>
+                       </div>
+                       <div className="w-full bg-[#1E2024] rounded-full h-2">
+                         <div className="bg-[#FF5500] h-2 rounded-full transition-all duration-300" style={{ width: `${encodeProgress.progress}%` }}></div>
+                       </div>
+                    </div>
+                  )}
+
                   <div className="border border-[#2A2D32] rounded bg-[#0D0E11] shadow-inner max-h-[300px] overflow-y-auto">
                     <table className="w-full text-xs text-left font-mono">
                       <thead className="bg-[#1E2024] border-b border-[#2A2D32] text-[#9CA3AF] uppercase sticky top-0">
@@ -376,6 +447,17 @@ export default function App() {
             </div>
 
             <div className="p-6">
+              <div className="mb-6">
+                <label className="block text-[10px] text-[#6B7280] uppercase tracking-widest mb-2">Decryption Key (if encrypted)</label>
+                <input 
+                  type="text" 
+                  placeholder="Enter key to decrypt (Optional)..."
+                  value={decryptionKey}
+                  onChange={(e) => setDecryptionKey(e.target.value)}
+                  className="w-full bg-[#0D0E11] border border-[#2A2D32] text-[#E0E0E0] rounded p-3 text-xs focus:border-[#00EEFF] outline-none transition-colors"
+                />
+              </div>
+
               <div className="mb-8">
                 <label className={`block w-full border-2 border-dashed border-[#2A2D32] rounded-lg p-10 flex flex-col items-center justify-center bg-[#0D0E11] group cursor-pointer hover:border-[#00EEFF] transition-colors ${isDecoding ? 'opacity-50 pointer-events-none' : ''}`}>
                   <input type="file" accept="video/mp4,video/webm,.mp4,.webm" className="hidden" onChange={handleVideoUpload} disabled={isDecoding} />
@@ -385,11 +467,25 @@ export default function App() {
                     <Upload className="w-10 h-10 text-[#4B5563] group-hover:text-[#00EEFF] mb-4 transition-colors" />
                   )}
                   <p className="text-sm text-[#9CA3AF] mb-1">
-                    {isDecoding ? 'Decoding video frames...' : 'Upload Video to Extract Data'}
+                    {isDecoding ? 'Decoding video...' : 'Upload Video to Extract Data'}
                   </p>
                   <p className="text-[10px] text-[#6B7280] uppercase tracking-widest">Supports .mp4 files generated by this tool</p>
                 </label>
               </div>
+
+              {isDecoding && decodeProgress && (
+                <div className="mb-6 p-4 border border-[#00EEFF]/30 rounded bg-[#0D0E11]">
+                   <div className="flex justify-between items-center mb-2">
+                     <span className="text-xs uppercase tracking-widest text-[#9CA3AF] font-bold">
+                       {decodeProgress.status === 'extracting_frames' ? 'Extracting Frames with FFmpeg...' : decodeProgress.status === 'reading_frames' ? 'Reading Data from Frames...' : 'Processing...'}
+                     </span>
+                     <span className="text-xs font-mono text-[#00EEFF]">{decodeProgress.progress}%</span>
+                   </div>
+                   <div className="w-full bg-[#1E2024] rounded-full h-2">
+                     <div className="bg-[#00EEFF] h-2 rounded-full transition-all duration-300" style={{ width: `${decodeProgress.progress}%` }}></div>
+                   </div>
+                </div>
+              )}
 
               {decodeError && (
                 <div className="mb-6 p-4 bg-red-950/30 text-red-500 rounded border border-red-900/50 flex items-center gap-3 text-sm">
