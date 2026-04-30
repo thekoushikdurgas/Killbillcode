@@ -1,0 +1,6 @@
+{
+  "name": "Infinite Video Storage",
+  "description": "Encode any CSV file into an MP4 video, and decode videos back into CSV format.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
